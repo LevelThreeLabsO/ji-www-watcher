@@ -1,0 +1,25 @@
+name: JI WWW watcher
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -r requirements.txt
+      - run: python3 poll.py
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          JI_COOKIE: ${{ secrets.JI_COOKIE }}
+          JI_BYPASS_TOKEN: ${{ secrets.JI_BYPASS_TOKEN }}
