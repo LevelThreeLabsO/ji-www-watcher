@@ -108,6 +108,21 @@ def node_to_slack(node):
     return inner
 
 
+# Strings that show up when we get a Cloudflare challenge or a logged-out /
+# paywalled page instead of the real subscriber list. If we see any of these
+# (or simply zero bullets on a non-first run), the cookie is almost certainly
+# expired and we must alert rather than silently watch the wrong content.
+AUTH_WALL_MARKERS = (
+    "just a moment",            # Cloudflare interstitial
+    "cf-browser-verification",
+    "attention required",
+    "enable javascript and cookies",
+    "subscribe to continue",
+    "sign in to continue",
+)
+ALERT_THROTTLE_H = 6            # don't re-alert more than once per this many hours
+
+
 def fetch_bullets():
     headers = {"User-Agent": UA}
     if JI_COOKIE:
@@ -130,7 +145,7 @@ def fetch_bullets():
         formatted = re.sub(r" +([,.;:!?)])", r"\1", formatted)
         formatted = re.sub(r"([(]) +", r"\1", formatted)
         bullets.append((plain, formatted))
-    return bullets
+    return bullets, html
 
 
 def bullet_id(text):
@@ -146,17 +161,18 @@ def _parse_state(text):
     except Exception:
         return {"seen": set(), "last_new": None, "nudges": 0}
     if isinstance(data, list):  # legacy: just the seen ids
-        return {"seen": set(data), "last_new": None, "nudges": 0}
+        return {"seen": set(data), "last_new": None, "nudges": 0, "alerted_at": None}
     return {
         "seen": set(data.get("seen", [])),
         "last_new": data.get("last_new"),
         "nudges": data.get("nudges", 0),
+        "alerted_at": data.get("alerted_at"),
     }
 
 
 def load_state():
     return _parse_state(STATE_FILE.read_text()) if STATE_FILE.exists() else \
-        {"seen": set(), "last_new": None, "nudges": 0}
+        {"seen": set(), "last_new": None, "nudges": 0, "alerted_at": None}
 
 
 def save_state(state):
@@ -164,6 +180,7 @@ def save_state(state):
         "seen": sorted(state["seen"])[-500:],
         "last_new": state["last_new"],
         "nudges": state["nudges"],
+        "alerted_at": state.get("alerted_at"),
     }))
 
 
@@ -208,6 +225,60 @@ def post_to_slack(webhook, text):
     ).read()
 
 
+def body_class(html):
+    """The <body> class attribute, lowercased ('' if not found). WordPress tags
+    it 'freeuser' when NOT logged in as a subscriber; a valid cookie removes it."""
+    m = re.search(r"<body[^>]*\bclass=[\"']([^\"']*)[\"']", html, re.IGNORECASE)
+    return m.group(1).lower() if m else ""
+
+
+# Set True once we've confirmed from a real authenticated Actions run that the
+# subscriber page does NOT carry the 'freeuser' body class. Until then we only
+# block on signals that provably can't false-positive on the working page.
+BLOCK_ON_FREEUSER = False
+
+
+def looks_like_auth_wall(html, bullets):
+    """True if the fetched page is logged-out / challenged rather than the real
+    subscriber list.
+
+    Signals, safest first:
+      - 'freeuser' body class = WordPress served the free/logged-out page. This is
+        the definitive expired-cookie signal for this site (an expired cookie does
+        NOT 403 — JI silently serves a different public snapshot). Gated behind
+        BLOCK_ON_FREEUSER until verified against an authenticated run.
+      - Cloudflare challenge / hard-block markers.
+      - Zero bullets at all.
+    """
+    if BLOCK_ON_FREEUSER and "freeuser" in body_class(html):
+        return True
+    low = html.lower()
+    if any(m in low for m in AUTH_WALL_MARKERS):
+        return True
+    return len(bullets) == 0
+
+
+def alert_auth_failure(state, now):
+    """Post a throttled Slack alert that the cookie looks dead. Persists
+    alerted_at so we warn at most once per ALERT_THROTTLE_H hours."""
+    last = state.get("alerted_at")
+    if last is not None and (now - last) < ALERT_THROTTLE_H * 3600:
+        print(f"Auth wall, but alerted {round((now-last)/3600,1)}h ago — throttled.")
+        return
+    post_to_slack(
+        WEBHOOK_URL,
+        ":warning: *What We're Watching watcher can't read the subscriber page.* "
+        "The JI cookie has almost certainly expired (or Cloudflare is blocking the "
+        "watcher). Until `JI_COOKIE` is refreshed, *no new-entry detection and no "
+        "Live Briefing nudges will fire.* Refresh the cookie in the "
+        "`ji-www-watcher` repo secrets.",
+    )
+    state["alerted_at"] = now
+    save_state(state)
+    record(state)
+    print("Posted auth-failure alert.")
+
+
 def maybe_nudge(state, now):
     """Post the Live Briefing nudge if one is due. Mutates and returns state."""
     if not LIVE_BRIEFING_WEBHOOK:
@@ -242,8 +313,20 @@ def main():
         return
 
     now = time.time()
-    bullets = fetch_bullets()
-    print(f"Fetched {len(bullets)} bullets from page.")
+    bullets, html = fetch_bullets()
+    bc = body_class(html)
+    print(f"Fetched {len(bullets)} bullets from page. "
+          f"Body class: '{bc}' (freeuser={'freeuser' in bc}).")
+
+    # Guard: a logged-out / Cloudflare-challenged page silently returns the wrong
+    # content. Detect it and alert instead of poisoning the state. (First-ever run
+    # with no state is exempt — nothing to protect yet.)
+    if STATE_FILE.exists() and looks_like_auth_wall(html, bullets):
+        print("Auth wall detected — page did not render the subscriber list.")
+        prev = latest_state()
+        alert_auth_failure(prev, now)
+        return
+
     current_ids = {bullet_id(plain) for plain, _ in bullets}
 
     if not STATE_FILE.exists():

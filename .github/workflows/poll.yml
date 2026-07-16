@@ -24,3 +24,12 @@ jobs:
           LIVE_BRIEFING_WEBHOOK: ${{ secrets.LIVE_BRIEFING_WEBHOOK }}
           JI_COOKIE: ${{ secrets.JI_COOKIE }}
           JI_BYPASS_TOKEN: ${{ secrets.JI_BYPASS_TOKEN }}
+      - name: Alert Slack if the run failed
+        if: failure()
+        run: |
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            --data "{\"text\":\":rotating_light: *WWW / Live-Briefing watcher run FAILED.* Check the log: $RUN_URL\"}" \
+            "$SLACK_WEBHOOK_URL" || true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
