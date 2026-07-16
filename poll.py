@@ -232,10 +232,11 @@ def body_class(html):
     return m.group(1).lower() if m else ""
 
 
-# Set True once we've confirmed from a real authenticated Actions run that the
-# subscriber page does NOT carry the 'freeuser' body class. Until then we only
-# block on signals that provably can't false-positive on the working page.
-BLOCK_ON_FREEUSER = False
+# Verified 2026-07-16 against a real authenticated Actions run: the subscriber
+# page's <body> carries 'logged-in' and NOT 'freeuser'; the logged-out/expired-
+# cookie page carries 'freeuser'. So blocking on 'freeuser' cannot false-positive
+# on the working page.
+BLOCK_ON_FREEUSER = True
 
 
 def looks_like_auth_wall(html, bullets):
