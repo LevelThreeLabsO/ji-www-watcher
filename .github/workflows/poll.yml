@@ -24,12 +24,21 @@ jobs:
           LIVE_BRIEFING_WEBHOOK: ${{ secrets.LIVE_BRIEFING_WEBHOOK }}
           JI_COOKIE: ${{ secrets.JI_COOKIE }}
           JI_BYPASS_TOKEN: ${{ secrets.JI_BYPASS_TOKEN }}
-      - name: Alert Slack if the run failed
+      # Alert only on the FIRST failure of a streak — if the previous completed
+      # run also failed, stay quiet so a broken state can't flood the channel.
+      - name: Alert Slack if the run failed (once per streak)
         if: failure()
         run: |
+          prev=$(gh run list --workflow poll.yml --branch main --status completed \
+                   --limit 1 --json conclusion -q '.[0].conclusion' 2>/dev/null || echo "")
+          if [ "$prev" = "failure" ]; then
+            echo "Previous run already failed — suppressing duplicate alert."
+            exit 0
+          fi
           curl -sS -X POST -H 'Content-Type: application/json' \
-            --data "{\"text\":\":rotating_light: *WWW / Live-Briefing watcher run FAILED.* Check the log: $RUN_URL\"}" \
+            --data "{\"username\":\"LB Watcher\",\"text\":\":rotating_light: *LB Watcher run FAILED* (first of a streak — you won't be pinged again until it recovers). Log: $RUN_URL\"}" \
             "$SLACK_WEBHOOK_URL" || true
         env:
+          GH_TOKEN: ${{ github.token }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

@@ -202,9 +202,18 @@ def save_state(state):
 
 
 def git(*args):
-    return subprocess.run(
-        ["git", "-C", str(REPO), *args], capture_output=True, text=True, timeout=30
-    )
+    """Run a git command. A timeout or other subprocess error is NON-fatal:
+    return a failed result so callers fall back (latest_state -> local state,
+    record -> retry/skip) instead of crashing the whole run over a transient
+    GitHub git hiccup."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(REPO), *args],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.SubprocessError as e:
+        print(f"git {' '.join(args)} did not complete ({e}) — treating as failed.")
+        return subprocess.CompletedProcess(args, returncode=1, stdout="", stderr=str(e))
 
 
 def latest_state():
@@ -235,7 +244,7 @@ def record(state):
 
 
 def post_to_slack(webhook, text):
-    body = json.dumps({"text": text}).encode()
+    body = json.dumps({"text": text, "username": "LB Watcher"}).encode()
     urlopen(
         Request(webhook, data=body, headers={"Content-Type": "application/json"}),
         timeout=15,
