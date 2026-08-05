@@ -35,6 +35,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+import http.client
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
@@ -138,7 +139,9 @@ def fetch_bullets():
             last_err = e
             if e.code < 500:
                 raise  # 4xx — real problem, don't paper over it
-        except (URLError, TimeoutError) as e:
+        except (URLError, TimeoutError, http.client.HTTPException, ConnectionError, OSError) as e:
+            # Covers IncompleteRead, RemoteDisconnected, ChunkedEncodingError,
+            # connection reset, and general socket failures — all transient.
             last_err = e
         if attempt < 2:
             time.sleep(3 + 2 * attempt)  # 3s, 5s
