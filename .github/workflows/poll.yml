@@ -24,19 +24,29 @@ jobs:
           LIVE_BRIEFING_WEBHOOK: ${{ secrets.LIVE_BRIEFING_WEBHOOK }}
           JI_COOKIE: ${{ secrets.JI_COOKIE }}
           JI_BYPASS_TOKEN: ${{ secrets.JI_BYPASS_TOKEN }}
-      # Alert only on the FIRST failure of a streak — if the previous completed
-      # run also failed, stay quiet so a broken state can't flood the channel.
-      - name: Alert Slack if the run failed (once per streak)
+      # Alert only when we hit the 3rd consecutive failure. Isolated blips
+      # (single JI 5xx / network hiccup) get swallowed entirely; only sustained
+      # outages ping. On the 3rd fail we alert once, then stay quiet until a run
+      # succeeds again.
+      - name: Alert Slack if 3 consecutive runs have failed
         if: failure()
         run: |
           prev=$(gh run list --workflow poll.yml --branch main --status completed \
-                   --limit 1 --json conclusion -q '.[0].conclusion' 2>/dev/null || echo "")
-          if [ "$prev" = "failure" ]; then
-            echo "Previous run already failed — suppressing duplicate alert."
+                   --limit 3 --json conclusion -q '[.[].conclusion] | join(",")' 2>/dev/null || echo "")
+          # This run counts as the 3rd. Alert only if the two PRIOR completed runs both failed.
+          two_prior=$(echo "$prev" | cut -d, -f1,2)
+          if [ "$two_prior" != "failure,failure" ]; then
+            echo "Not yet a 3-in-a-row failure streak (prior completed runs: $prev) — suppressing alert."
+            exit 0
+          fi
+          # If the run BEFORE those two also failed, we've already alerted on this streak.
+          third_back=$(echo "$prev" | cut -d, -f3)
+          if [ "$third_back" = "failure" ]; then
+            echo "Streak already alerted on — staying quiet."
             exit 0
           fi
           curl -sS -X POST -H 'Content-Type: application/json' \
-            --data "{\"username\":\"LB Watcher\",\"text\":\":rotating_light: *LB Watcher run FAILED* (first of a streak — you won't be pinged again until it recovers). Log: $RUN_URL\"}" \
+            --data "{\"username\":\"LB Watcher\",\"text\":\":rotating_light: *LB Watcher: 3 consecutive runs FAILED.* You won't be pinged again until it recovers. Log: $RUN_URL\"}" \
             "$SLACK_WEBHOOK_URL" || true
         env:
           GH_TOKEN: ${{ github.token }}
