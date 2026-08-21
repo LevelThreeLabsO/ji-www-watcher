@@ -195,8 +195,12 @@ def load_state():
 
 
 def save_state(state):
+    # Cap raised from 500 to 10000. The old 500 cap paired with lexical sort
+    # dropped random on-page bullets from the seen set, causing them to
+    # re-appear as "new" and re-post to Slack. 10000 gives ~10+ years of runway
+    # given typical WWW additions per day, and the state file stays small.
     STATE_FILE.write_text(json.dumps({
-        "seen": sorted(state["seen"])[-500:],
+        "seen": sorted(state["seen"])[-10000:],
         "last_new": state.get("last_new"),
         "nudges": state["nudges"],
         "alerted_at": state.get("alerted_at"),
