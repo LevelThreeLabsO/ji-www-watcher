@@ -185,6 +185,7 @@ def _parse_state(text):
         "nudges": data.get("nudges", 0),
         "alerted_at": data.get("alerted_at"),
         "page_updated": data.get("page_updated"),
+        "last_nudge_at": data.get("last_nudge_at"),
     }
 
 
@@ -205,6 +206,7 @@ def save_state(state):
         "nudges": state["nudges"],
         "alerted_at": state.get("alerted_at"),
         "page_updated": state.get("page_updated"),
+        "last_nudge_at": state.get("last_nudge_at"),
     }))
 
 
@@ -366,8 +368,18 @@ def maybe_nudge(state, now, page_updated_ts):
     print(f"Page last updated {stamp}, {elapsed_h:.2f}h ago; "
           f"{state['nudges']} nudge(s) sent; next due at {due_at}h.")
     if elapsed_h >= due_at:
+        # Minimum-gap guard: never fire two nudges within min(CYCLE) hours of
+        # each other, even if cumulative_offset says we're "overdue" (e.g. after
+        # a cadence change or watcher downtime catching up on stale state).
+        min_gap_s = min(CYCLE) * 3600
+        last_nudge_at = state.get("last_nudge_at") or 0
+        if now - last_nudge_at < min_gap_s:
+            print(f"Last nudge was {(now - last_nudge_at)/3600:.2f}h ago; "
+                  f"minimum gap is {min(CYCLE)}h — holding fire.")
+            return state
         post_to_slack(LIVE_BRIEFING_WEBHOOK, nudge_text(elapsed_h))
         state["nudges"] += 1
+        state["last_nudge_at"] = now
         print(f"Posted nudge #{state['nudges'] - 1}.")
     return state
 
