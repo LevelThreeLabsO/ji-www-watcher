@@ -9,11 +9,16 @@ permissions:
   contents: write
 
 concurrency:
-  group: poll
+  # Renamed from "poll" after a zombie job (41861718327) wedged that lock on
+  # 2026-11-04. Bumping the group name bypasses the stuck queue. Bumped again
+  # if this happens again.
+  group: poll-v2
   cancel-in-progress: false
 
 jobs:
   poll:
+    # Hard ceiling so a hung runner clears itself in minutes, not GH's default 6h
+    timeout-minutes: 3
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
