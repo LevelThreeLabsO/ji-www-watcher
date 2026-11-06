@@ -30,6 +30,7 @@ Legacy state files (a bare JSON array of ids) are migrated automatically.
 import hashlib
 import json
 import os
+import sys
 import re
 import subprocess
 import time
@@ -37,7 +38,9 @@ from datetime import datetime
 from pathlib import Path
 import http.client
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from http.cookiejar import CookieJar
+from urllib.parse import urlencode
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -46,8 +49,11 @@ WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 LIVE_BRIEFING_WEBHOOK = os.environ.get("LIVE_BRIEFING_WEBHOOK", "")
 JI_COOKIE = os.environ.get("JI_COOKIE", "")
 BYPASS_TOKEN = os.environ.get("JI_BYPASS_TOKEN", "")
+JI_USERNAME = os.environ.get("JI_USERNAME", "")
+JI_PASSWORD = os.environ.get("JI_PASSWORD", "")
 
 PAGE_URL = "https://jewishinsider.com/what-we-are-watching/"
+LOGIN_URL = "https://jewishinsider.com/wp-login.php"
 STATE_FILE = Path(__file__).parent / "watcher_state.json"
 REPO = STATE_FILE.parent
 MIN_BULLET_LENGTH = 80
@@ -120,38 +126,36 @@ AUTH_WALL_MARKERS = (
 ALERT_THROTTLE_H = 6            # don't re-alert more than once per this many hours
 
 
-def fetch_bullets():
+def _fetch_html(cookie_header):
+    """GET the WWW page with the given Cookie header. Retries transient
+    JI-side blips (5xx, timeouts, connection drops) up to 3x. 4xx bubbles up."""
     headers = {"User-Agent": UA}
-    if JI_COOKIE:
-        headers["Cookie"] = JI_COOKIE
+    if cookie_header:
+        headers["Cookie"] = cookie_header
     if BYPASS_TOKEN:
         headers["X-JI-Watcher-Token"] = BYPASS_TOKEN
-    # Retry transient JI-side hiccups (5xx, network timeouts, connection resets)
-    # so a brief upstream blip doesn't fail the whole run. Give up on 4xx
-    # (401/403 = cookie problem — retrying won't help; let it bubble up).
     last_err = None
     for attempt in range(3):
         try:
             with urlopen(Request(PAGE_URL, headers=headers), timeout=30) as r:
-                html = r.read().decode()
-            break
+                return r.read().decode()
         except HTTPError as e:
             last_err = e
             if e.code < 500:
-                raise  # 4xx — real problem, don't paper over it
+                raise
         except (URLError, TimeoutError, http.client.HTTPException, ConnectionError, OSError) as e:
-            # Covers IncompleteRead, RemoteDisconnected, ChunkedEncodingError,
-            # connection reset, and general socket failures — all transient.
             last_err = e
         if attempt < 2:
-            time.sleep(3 + 2 * attempt)  # 3s, 5s
-    else:
-        raise last_err
+            time.sleep(3 + 2 * attempt)
+    raise last_err
+
+
+def _parse_bullets(html):
     soup = BeautifulSoup(html, "html.parser")
     bullets = []
     for li in soup.find_all("li", class_="ww-item"):
         if li.find(class_="wr_item_container"):
-            continue  # skip Worthy Reads section — different content, not wanted
+            continue  # skip Worthy Reads section
         plain = li.get_text(separator=" ", strip=True)
         if len(plain) < MIN_BULLET_LENGTH:
             continue
@@ -161,7 +165,58 @@ def fetch_bullets():
         formatted = re.sub(r" +([,.;:!?)])", r"\1", formatted)
         formatted = re.sub(r"([(]) +", r"\1", formatted)
         bullets.append((plain, formatted))
-    return bullets, html
+    return bullets
+
+
+def login():
+    """POST credentials to wp-login.php; return a fresh Cookie header, or None
+    if no credentials are configured or the login didn't produce a WP session
+    cookie. Does NOT raise on failed login (so the caller can fall back to the
+    stored JI_COOKIE and let the run fail naturally if that's also dead)."""
+    if not JI_USERNAME or not JI_PASSWORD:
+        return None
+    cj = CookieJar()
+    opener = build_opener(HTTPCookieProcessor(cj))
+    opener.addheaders = [("User-Agent", UA), ("Referer", LOGIN_URL)]
+    try:
+        # Prime the test cookie WP checks on POST.
+        opener.open(LOGIN_URL, timeout=30).read()
+    except Exception as e:
+        print(f"Login GET failed: {e}")
+    data = urlencode({
+        "log": JI_USERNAME,
+        "pwd": JI_PASSWORD,
+        "rememberme": "forever",
+        "wp-submit": "Log In",
+        "redirect_to": PAGE_URL,
+        "testcookie": "1",
+    }).encode()
+    try:
+        opener.open(LOGIN_URL, data=data, timeout=30).read()
+    except Exception as e:
+        print(f"Login POST failed: {e}")
+        return None
+    header = "; ".join(f"{c.name}={c.value}" for c in cj)
+    if "wordpress_logged_in_" in header:
+        print("Auto-login succeeded — got fresh WP session cookies.")
+        return header
+    print("Auto-login did not produce a wordpress_logged_in cookie (bad creds? "
+          "Cloudflare? 2FA?).")
+    return None
+
+
+def fetch_bullets():
+    """Fetch the page with the stored cookie. If it comes back as the
+    logged-out/freeuser snapshot AND we have credentials, auto-login and retry
+    once. Returns (bullets, html)."""
+    cookie_header = JI_COOKIE
+    html = _fetch_html(cookie_header)
+    if "freeuser" in body_class(html) and JI_USERNAME and JI_PASSWORD:
+        print("freeuser body class — stored cookie looks dead. Auto-logging in.")
+        fresh = login()
+        if fresh:
+            html = _fetch_html(fresh)
+    return _parse_bullets(html), html
 
 
 def bullet_id(text):
@@ -316,24 +371,21 @@ def looks_like_auth_wall(html, bullets):
 
 
 def alert_auth_failure(state, now):
-    """Post a throttled Slack alert that the cookie looks dead. Persists
-    alerted_at so we warn at most once per ALERT_THROTTLE_H hours."""
+    """Silently log an auth-wall detection. Slack posting was removed 2026-11-06
+    once auto-login landed: fetch_bullets self-heals a dead cookie via
+    login(), so a sustained freeuser state means login itself is failing
+    (bad creds / Cloudflare / 2FA) and will surface as the existing
+    3-consecutive-failures alert in the workflow — no need for a separate
+    chatty one."""
     last = state.get("alerted_at")
     if last is not None and (now - last) < ALERT_THROTTLE_H * 3600:
-        print(f"Auth wall, but alerted {round((now-last)/3600,1)}h ago — throttled.")
+        print(f"Auth wall, suppressed-last-logged {round((now-last)/3600,1)}h ago.")
         return
-    post_to_slack(
-        WEBHOOK_URL,
-        ":warning: *What We're Watching watcher can't read the subscriber page.* "
-        "The JI cookie has almost certainly expired (or Cloudflare is blocking the "
-        "watcher). Until `JI_COOKIE` is refreshed, *no new-entry detection and no "
-        "Live Briefing nudges will fire.* Refresh the cookie in the "
-        "`ji-www-watcher` repo secrets.",
-    )
+    print("Auth wall detected after auto-login attempt — fetch returned freeuser. "
+          "Not posting to Slack (self-heal already tried).")
     state["alerted_at"] = now
     save_state(state)
     record(state)
-    print("Posted auth-failure alert.")
 
 
 def maybe_nudge(state, now, page_updated_ts):
@@ -399,13 +451,15 @@ def main():
           f"Body class: '{bc}' (freeuser={'freeuser' in bc}).")
 
     # Guard: a logged-out / Cloudflare-challenged page silently returns the wrong
-    # content. Detect it and alert instead of poisoning the state. (First-ever run
+    # content. fetch_bullets() already tried to self-heal via login(); if we're
+    # still on the auth wall, login itself is failing. Exit non-zero so the
+    # workflow's 3-consecutive-failures alert eventually fires. (First-ever run
     # with no state is exempt — nothing to protect yet.)
     if STATE_FILE.exists() and looks_like_auth_wall(html, bullets):
-        print("Auth wall detected — page did not render the subscriber list.")
+        print("Auth wall persisted even after auto-login — failing the run.")
         prev = latest_state()
         alert_auth_failure(prev, now)
-        return
+        sys.exit(1)
 
     page_updated_ts = parse_page_updated(html)
     if page_updated_ts:

@@ -29,6 +29,11 @@ jobs:
           LIVE_BRIEFING_WEBHOOK: ${{ secrets.LIVE_BRIEFING_WEBHOOK }}
           JI_COOKIE: ${{ secrets.JI_COOKIE }}
           JI_BYPASS_TOKEN: ${{ secrets.JI_BYPASS_TOKEN }}
+          # Credentials for auto-login when JI_COOKIE goes dead. poll.py's
+          # fetch_bullets() detects the freeuser body class and POSTs these
+          # to wp-login.php, grabbing a fresh WP session cookie in-process.
+          JI_USERNAME: ${{ secrets.JI_USERNAME }}
+          JI_PASSWORD: ${{ secrets.JI_PASSWORD }}
       # Alert only when we hit the 3rd consecutive failure. Isolated blips
       # (single JI 5xx / network hiccup) get swallowed entirely; only sustained
       # outages ping. On the 3rd fail we alert once, then stay quiet until a run
